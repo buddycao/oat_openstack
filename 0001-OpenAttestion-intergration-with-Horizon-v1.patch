@@ -1,0 +1,274 @@
+From a0b34579ed3bc122a6b0422a50c1032d2e5fe357 Mon Sep 17 00:00:00 2001
+From: Fegnqian Gao <fengqian.gao@intel.com>
+Date: Tue, 25 Aug 2015 14:15:04 +0800
+Subject: [PATCH] OpenAttestion intergration with Horizon v1
+
+---
+ openstack_dashboard/api/__init__.py                |    2 +
+ openstack_dashboard/api/txt.py                     |   85 ++++++++++++++++++++
+ .../dashboards/admin/aggregates/tables.py          |   33 +++++++-
+ .../aggregates/templates/aggregates/trust.html     |   19 +++++
+ .../dashboards/admin/aggregates/urls.py            |    1 +
+ .../dashboards/admin/aggregates/views.py           |   31 +++++++
+ 6 files changed, 169 insertions(+), 2 deletions(-)
+ create mode 100644 openstack_dashboard/api/txt.py
+ create mode 100644 openstack_dashboard/dashboards/admin/aggregates/templates/aggregates/trust.html
+
+diff --git a/openstack_dashboard/api/__init__.py b/openstack_dashboard/api/__init__.py
+index 9e7ad14..05392d5 100644
+--- a/openstack_dashboard/api/__init__.py
++++ b/openstack_dashboard/api/__init__.py
+@@ -46,6 +46,7 @@ from openstack_dashboard.api import sahara
+ from openstack_dashboard.api import swift
+ from openstack_dashboard.api import trove
+ from openstack_dashboard.api import vpn
++from openstack_dashboard.api import txt
+ 
+ 
+ __all__ = [
+@@ -64,4 +65,5 @@ __all__ = [
+     "trove",
+     "vpn",
+     "sahara",
++    "txt",
+ ]
+diff --git a/openstack_dashboard/api/txt.py b/openstack_dashboard/api/txt.py
+new file mode 100644
+index 0000000..8eb8795
+--- /dev/null
++++ b/openstack_dashboard/api/txt.py
+@@ -0,0 +1,85 @@
++import logging
++
++from django.conf import settings
++
++from novaclient.v1_1 import client as nova_client
++from novaclient import base as novaclient_base
++
++from openstack_dashboard.api import base
++
++LOG = logging.getLogger(__name__)
++
++
++class TXTManager(novaclient_base.ManagerWithFind):
++
++    def get_trusted_host_list(self):
++        url = "/os-txt/get_trusted_host_list"
++        resp, body = self.api.client.get(url)
++        return body['trusted_hosts']
++
++    def get_pcr_value(self, host):
++        url = "/os-txt/get_pcr_value?host=%s" % host
++        resp,body = self.api.client.get(url)
++        data = body['data']
++        if data is not None:
++            return data
++        else:
++            return []
++
++    def get_trust_hosts_info(self, host):
++        url = "/os-txt/get_trust_level?host=%s" % host
++        resp, body = self.api.client.get(url)
++        data = body['hosts']
++        if data is not None:
++            return data
++        else:
++            return "unknown"
++
++    def list(self):
++        pass
++
++class PCRValue(base.APIDictWrapper):
++
++    __attrs = ['number', 'value']
++
++    @property
++    def id(self):
++        return getattr(self, 'number')
++
++def novaclient(request):
++    insecure = getattr(settings, 'OPENSTACK_SSL_NO_VERIFY', False)
++    cacert = getattr(settings, 'OPENSTACK_SSL_CACERT', None)
++    LOG.debug('novaclient connection created using token "%s" and url "%s"' %
++              (request.user.token.id, base.url_for(request, 'compute')))
++    c = nova_client.Client(request.user.username,
++                           request.user.token.id,
++                           project_id=request.user.tenant_id,
++                           auth_url=base.url_for(request, 'compute'),
++                           insecure=insecure,
++                           cacert=cacert,
++                           http_log_debug=settings.DEBUG)
++    c.client.auth_token = request.user.token.id
++    c.client.management_url = base.url_for(request, 'compute')
++    c.txt = TXTManager(c)
++    return c
++    
++
++def trusted_host_list(request):
++    host_list = novaclient(request).txt.get_trusted_host_list()
++    return host_list
++
++def host_get_PCRValue(request,host_name):
++    try:
++        pcr_values = novaclient(request).txt.get_pcr_value(host_name)
++        return [PCRValue(pcr) for pcr in pcr_values]
++    except Exception:
++        return []
++
++def host_trust_level(request, host_name):
++    host = host_name.encode('ascii', 'ignore')
++    try:
++        retval = novaclient(request).txt.get_trust_hosts_info(host)
++        trusted_level = retval[0]["trust_lvl"]
++        return trusted_level
++    except Exception:
++        return "unkown"
+diff --git a/openstack_dashboard/dashboards/admin/aggregates/tables.py b/openstack_dashboard/dashboards/admin/aggregates/tables.py
+index 881b877..91cd601 100644
+--- a/openstack_dashboard/dashboards/admin/aggregates/tables.py
++++ b/openstack_dashboard/dashboards/admin/aggregates/tables.py
+@@ -10,6 +10,7 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++from django.core import urlresolvers
+ from django.template import defaultfilters as filters
+ from django.utils.translation import ugettext_lazy as _
+ from django.utils.translation import ungettext_lazy
+@@ -113,10 +114,29 @@ def get_zone_hosts(zone):
+     host_details = []
+     if hosts is None:
+         return []
++
++    trusted_host_list = zone.trusted_host_list
++    trusted_host_dict = {}
++    for trusted_host in trusted_host_list:
++        host_name = trusted_host['host_name']
++        trust_lvl = trusted_host.get('trust_lvl', 'unknown')
++        trusted_host_dict[host_name] = trust_lvl
++
+     for name, services in hosts.items():
+         up = all(s['active'] and s['available'] for s in services.values())
+         up = _("Services Up") if up else _("Services Down")
+-        host_details.append("%(host)s (%(up)s)" % {'host': name, 'up': up})
++
++        trust = trusted_host_dict.get(name, 'unknown')
++        link = ("horizon:admin:aggregates:trust")
++        url = urlresolvers.reverse(link, args=(name,))
++
++        # host_details.append("%(host)s (%(up)s)" % {'host': name, 'up': up})
++        host_details.append('<a href="%(url)s">%(host)s </a> '
++                            '(%(up)s, %(trust)s)' %
++                                 {'host': name,
++                                  'up': up,
++                                  'trust': trust,
++                                  'url': url})
+     return host_details
+ 
+ 
+@@ -155,7 +175,8 @@ class AvailabilityZonesTable(tables.DataTable):
+     hosts = tables.Column(get_zone_hosts,
+                           verbose_name=_('Hosts'),
+                           wrap_list=True,
+-                          filters=(safe_unordered_list,))
++                          filters=(filters.unordered_list,))
++                          #filters=(safe_unordered_list,))
+     available = tables.Column(get_available,
+                               verbose_name=_('Available'),
+                               status=True,
+@@ -169,3 +190,11 @@ class AvailabilityZonesTable(tables.DataTable):
+         verbose_name = _("Availability Zones")
+         table_actions = (AvailabilityZoneFilterAction,)
+         multi_select = False
++
++
++class HostAttestationTable(tables.DataTable):
++    pcr_number = tables.Column("id", verbose_name=_("PCR Number"))
++    pcr_value = tables.Column("value", verbose_name=_("PCR Value"))
++
++    class Meta:
++        name = "pcr value"
+diff --git a/openstack_dashboard/dashboards/admin/aggregates/templates/aggregates/trust.html b/openstack_dashboard/dashboards/admin/aggregates/templates/aggregates/trust.html
+new file mode 100644
+index 0000000..1775de0
+--- /dev/null
++++ b/openstack_dashboard/dashboards/admin/aggregates/templates/aggregates/trust.html
+@@ -0,0 +1,19 @@
++{% extends 'base.html' %}
++{% load i18n sizeformat %}
++{% block title %}{% trans "TXT Attestation" %}{% endblock %}
++
++{% block page_header %}
++  {% include "horizon/common/_page_header.html" with title=_("TXT Attestation") %}
++{% endblock page_header %}
++
++{% block main %}
++   <h3>Attestation</h3>
++    <dl>
++        <dt>Host</dt>
++        <dd>{{host}}</dd>
++        <dt>Trust Level</dt>
++        <dd>{{trust}}</dd>
++    </dl>
++    {{ table.render }}
++{% endblock %}
++
+diff --git a/openstack_dashboard/dashboards/admin/aggregates/urls.py b/openstack_dashboard/dashboards/admin/aggregates/urls.py
+index f06758c..eed92d1 100644
+--- a/openstack_dashboard/dashboards/admin/aggregates/urls.py
++++ b/openstack_dashboard/dashboards/admin/aggregates/urls.py
+@@ -28,4 +28,5 @@ urlpatterns = patterns('openstack_dashboard.dashboards.admin.aggregates.views',
+         views.UpdateMetadataView.as_view(), name='update_metadata'),
+     url(r'^(?P<id>[^/]+)/manage_hosts/$',
+         views.ManageHostsView.as_view(), name='manage_hosts'),
++    url(r'^(?P<id>[^/]+)/trust/$', views.TrustView.as_view(), name='trust'),
+ )
+diff --git a/openstack_dashboard/dashboards/admin/aggregates/views.py b/openstack_dashboard/dashboards/admin/aggregates/views.py
+index 354f98e..d2e1751 100644
+--- a/openstack_dashboard/dashboards/admin/aggregates/views.py
++++ b/openstack_dashboard/dashboards/admin/aggregates/views.py
+@@ -58,6 +58,10 @@ class IndexView(tables.MultiTableView):
+         try:
+             availability_zones = \
+                 api.nova.availability_zone_list(self.request, detailed=True)
++            trusted_host_list = api.txt.trusted_host_list(self.request)
++            for zone in availability_zones:
++                setattr(zone,
++                        'trusted_host_list', trusted_host_list)
+         except Exception:
+             exceptions.handle(request,
+                               _('Unable to retrieve availability zone list.'))
+@@ -158,3 +162,30 @@ class ManageHostsView(workflows.WorkflowView):
+         context = super(ManageHostsView, self).get_context_data(**kwargs)
+         context['id'] = self.kwargs['id']
+         return context
++
++
++class TrustView(tables.DataTableView):
++    table_class = project_tables.HostAttestationTable
++    template_name = 'admin/aggregates/trust.html'
++
++    def get_context_data(self, **kwargs):
++        context = super(TrustView, self).get_context_data(**kwargs)
++        try:
++            host = self.kwargs['id']
++            trusted = api.txt.host_trust_level(self.request, host)
++            context['host'] = host
++            context['trust'] = trusted
++        except Exception:
++            msg = _('Unable to get trusted for host "%s".') % host
++            exceptions.handle(self.request, msg)
++        return context
++
++    def get_data(self):
++        try:
++            host = self.kwargs['id']
++            pcr_value_list = api.txt.host_get_PCRValue(self.request, host)
++        except Exception:
++            msg = _('Unable to retrieve PCR values for host "%s".') % host
++            exceptions.handle(self.request, msg)
++
++        return pcr_value_list
+-- 
+1.7.9.5
+

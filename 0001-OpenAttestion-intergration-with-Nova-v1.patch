@@ -1,0 +1,501 @@
+From c7bfd5b52524f10c2ff1f1932313cb6b3fcfe0f0 Mon Sep 17 00:00:00 2001
+From: Fegnqian Gao <fengqian.gao@intel.com>
+Date: Mon, 24 Aug 2015 09:59:19 +0800
+Subject: [PATCH] OpenAttestion intergration with Nova v1
+
+---
+ nova/cmd/txt.py                          |   43 +++++++++++++
+ nova/scheduler/filters/trusted_filter.py |   12 +++-
+ nova/scheduler/manager.py                |    6 ++
+ nova/scheduler/rpcapi.py                 |    3 +
+ nova/txt/__init__.py                     |   25 ++++++++
+ nova/txt/api.py                          |   36 +++++++++++
+ nova/txt/attestionservice.py             |   96 ++++++++++++++++++++++++++++++
+ nova/txt/manager.py                      |   89 +++++++++++++++++++++++++++
+ nova/txt/txt.py                          |   62 +++++++++++++++++++
+ nova/txt/txt_flags.py                    |   21 +++++++
+ 10 files changed, 390 insertions(+), 3 deletions(-)
+ create mode 100644 nova/cmd/txt.py
+ create mode 100644 nova/txt/__init__.py
+ create mode 100644 nova/txt/api.py
+ create mode 100644 nova/txt/attestionservice.py
+ create mode 100644 nova/txt/manager.py
+ create mode 100644 nova/txt/txt.py
+ create mode 100644 nova/txt/txt_flags.py
+
+diff --git a/nova/cmd/txt.py b/nova/cmd/txt.py
+new file mode 100644
+index 0000000..a86ef6a
+--- /dev/null
++++ b/nova/cmd/txt.py
+@@ -0,0 +1,43 @@
++# Copyright 2010 United States Government as represented by the
++# Administrator of the National Aeronautics and Space Administration.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Starter script for Nova TXT."""
++
++import sys
++
++from oslo.config import cfg
++from nova import objects
++
++from nova import config
++from nova.openstack.common import log as logging
++from nova import service
++from nova import utils
++
++CONF = cfg.CONF
++CONF.import_opt('txt_topic', 'nova.txt.txt_flags')
++
++
++def main():
++    config.parse_args(sys.argv)
++    logging.setup(CONF, "nova")
++    utils.monkey_patch()
++    objects.register_all()
++    server = service.Service.create(binary='nova-txt',
++                                    topic=CONF.txt_topic,
++                                    db_allowed=CONF.conductor.use_local)
++    service.serve(server)
++    service.wait()
++
+diff --git a/nova/scheduler/filters/trusted_filter.py b/nova/scheduler/filters/trusted_filter.py
+index 59eecc4..17a339f 100644
+--- a/nova/scheduler/filters/trusted_filter.py
++++ b/nova/scheduler/filters/trusted_filter.py
+@@ -52,6 +52,7 @@ from nova.openstack.common import jsonutils
+ from nova.openstack.common import log as logging
+ from nova.openstack.common import timeutils
+ from nova.scheduler import filters
++from nova.txt import api as txt_api
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -253,13 +254,18 @@ class TrustedFilter(filters.BaseHostFilter):
+     """Trusted filter to support Trusted Compute Pools."""
+ 
+     def __init__(self):
+-        self.compute_attestation = ComputeAttestation()
++        self.compute_attestation = txt_api.TXTAPI()
++
++    def is_trusted(self, host, trust_level):
++        ctxt = context.get_admin_context()
++        trust_info = self.compute_attestation.get_trust_level(ctxt=ctxt, hosts=host)
++        return trust_info['hosts'][0]['trust_lvl'] == trust_level
+ 
+     def host_passes(self, host_state, filter_properties):
+         instance_type = filter_properties.get('instance_type', {})
+         extra = instance_type.get('extra_specs', {})
+         trust = extra.get('trust:trusted_host')
+-        host = host_state.nodename
++        host = host_state.host
+         if trust:
+-            return self.compute_attestation.is_trusted(host, trust)
++            return self.is_trusted(host, trust)
+         return True
+diff --git a/nova/scheduler/manager.py b/nova/scheduler/manager.py
+index c370d0c..85f069c 100644
+--- a/nova/scheduler/manager.py
++++ b/nova/scheduler/manager.py
+@@ -174,3 +174,9 @@ class SchedulerManager(manager.Manager):
+         dests = self.driver.select_destinations(context, request_spec,
+             filter_properties)
+         return jsonutils.to_primitive(dests)
++
++    def hosts_up(self, context, topic='compute'):
++        """Return host(s) running service of specific topic.
++        """
++        hosts = self.driver.hosts_up(context, topic)
++        return jsonutils.to_primitive(hosts)
+diff --git a/nova/scheduler/rpcapi.py b/nova/scheduler/rpcapi.py
+index cab0963..c01e7cb 100644
+--- a/nova/scheduler/rpcapi.py
++++ b/nova/scheduler/rpcapi.py
+@@ -106,3 +106,6 @@ class SchedulerAPI(object):
+         cctxt = self.client.prepare()
+         return cctxt.call(ctxt, 'select_destinations',
+             request_spec=request_spec, filter_properties=filter_properties)
++
++    def hosts_up(self, ctxt, topic='compute'):
++        return self.client.call(ctxt, 'hosts_up', topic=topic)
+diff --git a/nova/txt/__init__.py b/nova/txt/__init__.py
+new file mode 100644
+index 0000000..6ba3ce5
+--- /dev/null
++++ b/nova/txt/__init__.py
+@@ -0,0 +1,25 @@
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++# Importing full names to not pollute the namespace and cause possible
++# collisions with use of 'from nova.compute import <foo>' elsewhere.
++
++from oslo.config import cfg
++from .txt_flags import *
++from oslo.utils import importutils
++
++CONF = cfg.CONF
++CONF.register_opts(txt_opts)
++API = importutils.import_class(CONF.txt_api_class)
++
+diff --git a/nova/txt/api.py b/nova/txt/api.py
+new file mode 100644
+index 0000000..eacd418
+--- /dev/null
++++ b/nova/txt/api.py
+@@ -0,0 +1,36 @@
++from nova import exception
++from nova import rpc
++
++from oslo.config import cfg
++from oslo import messaging
++
++from nova.openstack.common import log as logging
++from nova.txt import attestionservice
++from nova.scheduler import rpcapi as scheduler_api
++
++CONF = cfg.CONF
++LOG = logging.getLogger(__name__)
++
++class TXTAPI(object):
++
++    def __init__(self):
++        super(TXTAPI, self).__init__()
++        target = messaging.Target(topic=CONF.txt_topic, version='1.0')
++        self.oat_api = attestionservice.AttestionService()
++        self.scheduler_api = scheduler_api.SchedulerAPI()
++        self.client = rpc.get_client(target)
++
++    def get_pcr_value(self, ctxt, host):
++        cctxt = self.client.prepare(server=host)
++        return cctxt.call(ctxt, "pcr_value")
++
++    def get_trust_level(self, ctxt, hosts):
++        cctxt = self.client.prepare(server=CONF.txt_period_host)
++        return cctxt.call(ctxt, "get_trust_host_info", hosts=hosts)
++
++    def hosts_up(self, context):
++        return self.scheduler_api.hosts_up(context)
++
++
++
++
+diff --git a/nova/txt/attestionservice.py b/nova/txt/attestionservice.py
+new file mode 100644
+index 0000000..8fc935c
+--- /dev/null
++++ b/nova/txt/attestionservice.py
+@@ -0,0 +1,96 @@
++from oslo.config import cfg
++import pycurl
++import requests
++import StringIO
++import simplejson
++
++from nova import context
++from nova import db
++from nova.openstack.common import jsonutils
++from nova.openstack.common import log as logging
++from nova.openstack.common import timeutils
++from nova.scheduler import filters
++
++LOG = logging.getLogger(__name__)
++
++trusted_opts = [
++    cfg.StrOpt('attestation_server',
++               help='Attestation server HTTP'),
++    cfg.StrOpt('attestation_server_cert_file',
++               help='Attestation server Cert file for Identity verification'),
++    cfg.StrOpt('attestation_port',
++               default='8181',
++               help='Attestation server port'),
++    cfg.StrOpt('attestation_api_url',
++               default='/AttestationService/resources/',
++               help='Attestation web API URL'),
++    cfg.IntOpt('attestation_auth_timeout',
++               default=60,
++               help='Attestation status cache valid period length'),
++    cfg.StrOpt('attestation_user_agent',
++               default='Mozilla/5.0 (Windows NT 6.1; WOW64; rv:8.0)'
++                       ' Gecko/20100101 Firefox/8.0',
++               help='User agent of curl'),
++    cfg.StrOpt('attestation_ssl_cert_type',
++               default='PEM',
++               help='Type of ssl cert file'),
++    cfg.BoolOpt('attestation_ssl_verify_peer',
++                default=True,
++                help='Whether or not verify the SSL peer certificate'),
++    cfg.IntOpt('attestation_ssl_verify_host',
++               default=2,
++               help='1 to check the existence of a common name'
++                    ' in the SSL peer certificate.'
++                    '2 to check the existence of a common name'
++                    ' and also verify that it matches the hostname provided'),
++]
++
++CONF = cfg.CONF
++#trust_group = cfg.OptGroup(name='trusted_computing', title='Trust parameters')
++# CONF.register_group(trust_group)
++CONF.register_opts(trusted_opts)
++
++
++class AttestionService(object):
++    """
++    """
++    def __init__(self):
++        self.oat_address = "https://%s:%s" % (CONF.attestation_server,
++                                              CONF.attestation_port)
++
++    @classmethod
++    def _create_curl(cls):
++        curl = pycurl.Curl()
++        curl.fp = StringIO.StringIO()
++        curl.setopt(curl.WRITEFUNCTION, curl.fp.write)
++
++        curl.setopt(pycurl.USERAGENT, CONF.attestation_user_agent)
++        curl.setopt(pycurl.CAINFO, CONF.attestation_server_cert_file)
++        curl.setopt(pycurl.SSLCERTTYPE, CONF.attestation_ssl_cert_type)
++        curl.setopt(pycurl.CONNECTTIMEOUT, CONF.attestation_auth_timeout)
++        curl.setopt(pycurl.SSL_VERIFYPEER, CONF.attestation_ssl_verify_peer)
++        curl.setopt(pycurl.SSL_VERIFYHOST, CONF.attestation_ssl_verify_host)
++
++        return curl
++
++    def set_curl_post(self, url, header, body):
++        curl = self._create_curl()
++
++        url = self.oat_address + url
++        curl.setopt(pycurl.URL, url)
++        curl.setopt(pycurl.HTTPHEADER, header)
++        curl.setopt(pycurl.POST, True)
++        curl.setopt(pycurl.POSTFIELDS, body)
++        curl.setopt(pycurl.PROXY, '')
++
++        return curl
++
++    def get_trust_hosts_info(self, hosts='[]'):
++        header = ["Content-Type: application/json"]
++        hosts = hosts.encode('ascii', 'ignore')
++        body = '{"hosts":%s}' % hosts
++        # LOG.info("body:%s"%body)
++        curl = self.set_curl_post("/AttestationService/resources/PollHosts",
++                                  header, body)
++        curl.perform()
++        return simplejson.loads(curl.fp.getvalue())
+diff --git a/nova/txt/manager.py b/nova/txt/manager.py
+new file mode 100644
+index 0000000..d5af197
+--- /dev/null
++++ b/nova/txt/manager.py
+@@ -0,0 +1,89 @@
++from nova import utils
++from oslo.config import cfg
++from oslo.utils import timeutils
++from nova import manager
++
++from nova.openstack.common import log as logging
++from nova.openstack.common import periodic_task
++from nova.txt import attestionservice as txt_comm
++from nova.txt import api as txt_api
++from nova.compute import api as compute_api
++from nova.scheduler import host_manager
++
++import os
++import simplejson
++
++CONF = cfg.CONF
++LOG = logging.getLogger('nova.txt.manager')
++
++class TXTManager(manager.Manager):
++    """
++    """
++
++    RPC_API_VERSION = '1.0'
++
++    def __init__(self, *args, **kwargs): 
++        super(TXTManager, self).__init__(*args, **kwargs)
++        self.txt_api = txt_api.TXTAPI()
++        self.compute_api = compute_api.API()
++        self.oat_comm = txt_comm.AttestionService()
++        self.trust_host_info = {}
++        self.host_manager = host_manager.HostManager()
++       
++    def pcr_value(self,context):
++        values = []
++        filename = '/sys/class/misc/tpm0/device/pcrs'
++        if os.path.isfile(filename):
++            f=open(filename,'r')
++            lines=f.readlines()
++            f.close()
++            for line in lines:
++                key_val = line.split(':')
++                value = {'number': key_val[0].strip(),
++                         'value': key_val[1].strip()
++                         }
++                values.append(value)
++        return values
++
++    def get_trust_host_info(self, context, hosts):
++        if not isinstance(hosts, list):
++            try:
++                hosts = simplejson.loads(hosts)
++            except Exception:
++                pass
++        if not isinstance(hosts, list):
++            hosts = [hosts]
++        
++        # LOG.info("Query trust info for hosts (%s)" % hosts) 
++        trust_host_infos = []
++        for host in hosts:
++            # LOG.info("Query trust info for host (%s)" % host)
++            host_info = self.trust_host_info.get(host, None)
++            LOG.info("Gao_test (%s)" % host_info)
++            if not host_info:
++                host_info ={"trust_lvl":"unknown",
++                             "vtime":timeutils.strtime(),
++                             "host_name":host
++                            }
++            trust_host_infos.append(host_info)
++
++        return {"hosts": trust_host_infos}
++        
++    @periodic_task.periodic_task(spacing=CONF.txt_timer_interval,
++                                 run_immediately=True)
++    def update_host_trust_levels(self, context):
++        if CONF.host == CONF.txt_period_host:
++            hosts = self.txt_api.hosts_up(context)
++            hosts_str = simplejson.dumps(hosts)
++            hosts_dict = self.oat_comm.get_trust_hosts_info(hosts_str)
++            hosts_info = hosts_dict['hosts']
++            
++            self.trust_host_info = {}
++            for host_info in hosts_info:
++                host_name = host_info['host_name']
++                self.trust_host_info[host_name] = host_info       
++            
++            LOG.debug("Updating hosts trusted info: %s" % self.trust_host_info)
++
++    def hosts_up(self, ctxt, topic='compute'):
++        return self.client.call(ctxt, 'hosts_up', topic=topic)
+diff --git a/nova/txt/txt.py b/nova/txt/txt.py
+new file mode 100644
+index 0000000..84e7eea
+--- /dev/null
++++ b/nova/txt/txt.py
+@@ -0,0 +1,62 @@
++import webob.exc
++from nova.api.openstack import wsgi
++from nova.api.openstack import extensions
++from nova.openstack.common import log as logging
++from nova.txt import api as txt_api
++
++LOG = logging.getLogger(__name__)
++authorize = extensions.extension_authorizer('compute', 'certificates')
++
++class TXTController(object):
++    """The servers addresses API controller for the OpenStack API."""
++
++    def __init__(self):
++        super(TXTController, self).__init__()        
++        self.txt_api = txt_api.TXTAPI()
++
++    def get_trusted_host_list(self, req):
++        context = req.environ['nova.context']
++        authorize(context)
++        hosts = self.txt_api.hosts_up(context)
++        # return {'trusted_hosts': hosts}
++        hosts_dict = self.txt_api.get_trust_level(context, hosts)
++        hosts_info = hosts_dict['hosts']
++        return {'trusted_hosts': hosts_info}
++
++    def get_pcr_value(self, req):
++        context = req.environ['nova.context']
++        authorize(context)
++        host = req.params['host']
++        pcr_value = self.txt_api.get_pcr_value(context, host)
++        return {'data': pcr_value}
++
++    def get_trust_level(self, req):
++        context = req.environ['nova.context']
++        host = req.params['host']
++        trust_level=self.txt_api.get_trust_level(context, host)
++        return trust_level
++
++    def get_host_list(self, req):
++        context = req.environ['nova.context']
++        hosts = self.txt_api.hosts_up(context)
++        return {"hosts": hosts}
++
++
++class TXT(extensions.ExtensionDescriptor):
++    """
++    """
++    name = "OStxt"
++    alias = "os-txt"
++    namespace = "http://ospc.flex.intel.com"
++    updated = "2014-05-02T00:00:00+00:00"
++
++    def get_resources(self):
++        resources = [extensions.ResourceExtension('os-txt',
++                     TXTController(),
++                     collection_actions = {
++                     'get_trusted_host_list':'GET',
++                     'get_pcr_value':'GET',
++                     'get_trust_level':'GET',
++                     'get_host_list':'GET',
++                     })]
++        return resources
+diff --git a/nova/txt/txt_flags.py b/nova/txt/txt_flags.py
+new file mode 100644
+index 0000000..349fc81
+--- /dev/null
++++ b/nova/txt/txt_flags.py
+@@ -0,0 +1,21 @@
++from oslo.config import cfg
++
++
++txt_opts = [
++    cfg.StrOpt('txt_manager',
++               default='nova.txt.manager.TXTManager',
++               help='Manager for txt'),
++    cfg.StrOpt('txt_topic',
++               default='txt',
++               help='the topic txt nodes listen on'),
++    cfg.StrOpt('txt_api_class',
++                default='nova.txt.api.TXTAPI',
++                help='The full class name of the txt API class to use'),
++    cfg.IntOpt('txt_timer_interval',
++               default=600,
++               help='timer interval for get txt info'),
++    cfg.StrOpt('txt_period_host',
++               default='localhost',
++               help='timer host name'),
++
++]
+-- 
+1.7.9.5
+
